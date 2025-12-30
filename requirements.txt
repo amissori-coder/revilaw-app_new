@@ -1,0 +1,14 @@
+streamlit
+openai
+pandas
+pymupdf
+pdfplumber
+instructor
+pydantic
+rank_bm25
+sentence-transformers
+torch
+rapidfuzz
+xlsxwriter
+plotly
+openpyxl
