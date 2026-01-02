@@ -1,0 +1,1228 @@
+import streamlit as st
+import fitz  # PyMuPDF
+import pdfplumber
+import pandas as pd
+from io import BytesIO
+import json
+import base64
+from openai import OpenAI, AsyncOpenAI
+import os
+import re
+import time
+import string
+import asyncio
+import random
+
+# LIBRERIE AVANZATE
+import instructor
+from pydantic import BaseModel, Field
+from typing import List, Literal
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer, util
+import torch
+from rapidfuzz import fuzz
+
+# ---------------------------------------------------------
+# CONFIGURAZIONE GENERALE & STILE
+# ---------------------------------------------------------
+st.set_page_config(
+    page_title="Revilaw AuditEv Hierarchy (Quality)",
+    layout="wide",
+    page_icon="🧬",
+    initial_sidebar_state="expanded"
+)
+
+st.markdown("""
+<style>
+    [data-testid="stMetric"] {
+        background-color: #ffffff;
+        padding: 15px;
+        border-radius: 10px;
+        border: 1px solid #e0e0e0;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+        transition: transform 0.2s;
+    }
+    [data-testid="stMetric"]:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 8px rgba(0,0,0,0.1);
+    }
+    div.stButton > button:first-child {
+        background-color: #003366;
+        color: white;
+        font-weight: bold;
+        border-radius: 8px;
+        padding: 0.6rem 1rem;
+        width: 100%;
+        border: none;
+    }
+    div.stButton > button:first-child:hover {
+        background-color: #004080;
+        color: #ffffff;
+    }
+    [data-testid="stSidebar"] {
+        background-color: #f8f9fa;
+        border-right: 1px solid #dee2e6;
+    }
+    h1, h2, h3 {
+        color: #003366;
+        font-family: 'Segoe UI', sans-serif;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+SOFTWARE_PROMPTS = {
+    "Generico / Non so": "Tabella conti standard.",
+    "Zucchetti (Ago/AdHoc/Mago)": "Layout Zucchetti. Codici tipo '2405001'.",
+    "TeamSystem (Alyante/Gamma)": "Layout TeamSystem. Codici tipo '10.20.30'.",
+    "Datev Koinos": "Layout Datev.",
+    "Sistemi (Profis)": "Layout Profis. Codici tipo '1234.5678'."
+}
+
+# =========================================================
+# API KEY (SICURA + NO CRASH SE SECRETS MANCANO)
+# =========================================================
+def get_api_key():
+    try:
+        return st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        return None
+
+api_key = get_api_key() or os.getenv("OPENAI_API_KEY")
+
+# =========================================================
+# MODELLI DATI
+# =========================================================
+class RigaBilancio(BaseModel):
+    codice: str = Field(..., description="Codice numerico del conto (es. 24.05.10 o 240501). Può essere vuoto.")
+    descrizione: str = Field(..., description="Descrizione analitica del conto")
+    natura: Literal["DARE", "AVERE"]
+    importo: float
+    is_raggruppamento: bool = Field(..., description="True se è un titolo/subtotale, False se conto analitico.")
+
+class BilancioEstratto(BaseModel):
+    righe: List[RigaBilancio]
+
+class RisultatoPDF(BaseModel):
+    trovato: bool
+    descrizione: str = ""
+    importo: float = 0.0
+    segno: Literal["UTILE", "PERDITA", "INCERTO"] = "INCERTO"
+
+# =========================================================
+# SESSION STATE
+# =========================================================
+if 'data_processed' not in st.session_state:
+    st.session_state['data_processed'] = None
+if 'combo_options' not in st.session_state:
+    st.session_state['combo_options'] = []
+if 'map_code_desc' not in st.session_state:
+    st.session_state['map_code_desc'] = {}
+if 'map_code_natura' not in st.session_state:
+    st.session_state['map_code_natura'] = {}
+if 'map_code_tipo' not in st.session_state:
+    st.session_state['map_code_tipo'] = {}
+if 'map_code_bucket' not in st.session_state:
+    st.session_state['map_code_bucket'] = {}
+if 'logs' not in st.session_state:
+    st.session_state['logs'] = []
+if 'raw_pdf_rows' not in st.session_state:
+    st.session_state['raw_pdf_rows'] = []
+
+def log(step: str, msg: str, level: str = "INFO"):
+    if "logs" not in st.session_state:
+        st.session_state["logs"] = []
+    st.session_state["logs"].append({
+        "time": time.strftime("%H:%M:%S"),
+        "level": level,
+        "step": step,
+        "msg": msg
+    })
+
+# =========================================================
+# ASYNC SAFE RUNNER
+# =========================================================
+def run_async(coro):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        new_loop = asyncio.new_event_loop()
+        try:
+            return new_loop.run_until_complete(coro)
+        finally:
+            new_loop.close()
+    else:
+        return asyncio.run(coro)
+
+# =========================================================
+# EMBEDDINGS
+# =========================================================
+@st.cache_resource
+def carica_modello_semantico():
+    return SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+
+semantic_model = carica_modello_semantico()
+
+# =========================================================
+# UTILS
+# =========================================================
+def leggi_csv_sicuro(file_obj):
+    try:
+        if file_obj.name.endswith('.xlsx'):
+            return pd.read_excel(file_obj, dtype=str)
+        file_obj.seek(0)
+        try:
+            df = pd.read_csv(file_obj, sep=None, engine='python', dtype=str)
+            if df.shape[1] >= 2:
+                return df
+        except:
+            pass
+        return None
+    except:
+        return None
+
+def simple_tokenize(text):
+    text = (text or "").lower()
+    return text.translate(str.maketrans('', '', string.punctuation)).split()
+
+def normalizza_codice(codice):
+    if not codice:
+        return ""
+    return re.sub(r'[^a-zA-Z0-9]', '', str(codice))
+
+def parse_importo(x):
+    if x is None:
+        return 0.0
+    s = str(x).strip()
+    s = s.replace("€", "").replace(" ", "")
+    if s.startswith("(") and s.endswith(")"):
+        s = "-" + s[1:-1]
+    if "." in s and "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        if "," in s and "." not in s:
+            s = s.replace(",", ".")
+    s = re.sub(r"[^0-9\.\-]", "", s)
+    try:
+        return float(s)
+    except:
+        return 0.0
+
+def normalize_desc(desc: str) -> str:
+    return re.sub(r"\s+", " ", (desc or "").strip())
+
+# =========================================================
+# RISULTATO D'ESERCIZIO (multi metodi)
+# =========================================================
+RIS_PATTERNS = [
+    r"risultato\s+d[’']?esercizio",
+    r"risultato\s+di\s+esercizio",
+    r"risultato\s+del\s+periodo",
+    r"utile\s*\(?.*perdita.*\)?\s+(d[’']?esercizio|di\s+esercizio)",
+    r"utile\s+d[’']?esercizio",
+    r"perdita\s+d[’']?esercizio",
+    r"utile\s*\(perdita\)",
+    r"utile\s*/\s*perdita",
+    r"risultato\s+netto",
+    r"utile\s+netto",
+    r"perdita\s+netta",
+    r"risultato\s+finale",
+    r"risultato\s+economico\s+d[’']?esercizio",
+]
+KEYWORDS_RIS = ["risultato", "esercizio", "utile", "perdita", "netto", "periodo"]
+
+def match_risultato_line(desc: str) -> bool:
+    d = (desc or "").lower()
+    if not any(k in d for k in KEYWORDS_RIS):
+        return False
+    return any(re.search(p, d, re.IGNORECASE) for p in RIS_PATTERNS)
+
+def estrai_risultato_da_rows(rows):
+    best_val, best_desc = None, None
+    for r in rows or []:
+        desc = (r.get("descrizione") or "").strip()
+        if not match_risultato_line(desc):
+            continue
+        imp = float(r.get("importo") or 0.0)
+        natura = (r.get("natura") or "DARE").upper()
+        if imp == 0:
+            continue
+        low = desc.lower()
+        if "perdita" in low:
+            val = -abs(imp)
+        elif "utile" in low:
+            val = abs(imp)
+        else:
+            val = abs(imp) if natura == "AVERE" else -abs(imp)
+        if best_val is None or abs(val) > abs(best_val):
+            best_val, best_desc = val, desc
+    return best_val, best_desc
+
+def estrai_risultato_da_testo_pdf(file_obj):
+    file_obj.seek(0)
+    best_val, best_line = None, None
+    with pdfplumber.open(file_obj) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.split("\n"):
+                if not match_risultato_line(line):
+                    continue
+                nums = re.findall(r"[-]?\(?\d{1,3}(?:\.\d{3})*(?:,\d{2})\)?", line)
+                if not nums:
+                    continue
+                imp = parse_importo(nums[-1])
+                low = line.lower()
+                if "perdita" in low:
+                    imp = -abs(imp)
+                elif "utile" in low:
+                    imp = abs(imp)
+                if best_val is None or abs(imp) > abs(best_val):
+                    best_val, best_line = imp, line.strip()
+    return best_val, best_line
+
+# =========================================================
+# CLASSIFICAZIONE: INFERISCE TIPO + BUCKET (A/P/C/R)
+# =========================================================
+def inferisci_tipo_bucket(natura_str: str):
+    s = (natura_str or "").strip().upper()
+
+    if s == "A":
+        return "SP", "ATTIVO"
+    if s == "P":
+        return "SP", "PASSIVO"
+    if s == "C":
+        return "CE", "COSTI"
+    if s == "R":
+        return "CE", "RICAVI"
+
+    tipo = None
+    bucket = None
+
+    if "CE" in s or "ECON" in s or "RICAV" in s or "COST" in s or "ONERI" in s or "PROVENT" in s:
+        tipo = "CE"
+    if "SP" in s or "PATR" in s or "ATTIV" in s or "PASSIV" in s:
+        tipo = "SP"
+
+    if "SP-A" in s or ("SP" in s and "ATT" in s):
+        bucket = "ATTIVO"; tipo = tipo or "SP"
+    elif "SP-P" in s or ("SP" in s and "PASS" in s):
+        bucket = "PASSIVO"; tipo = tipo or "SP"
+    elif "CE-C" in s or ("CE" in s and ("COST" in s or "ONER" in s)):
+        bucket = "COSTI"; tipo = tipo or "CE"
+    elif "CE-R" in s or ("CE" in s and ("RICAV" in s or "PROVENT" in s)):
+        bucket = "RICAVI"; tipo = tipo or "CE"
+
+    if bucket is None:
+        if "ATTIVO" in s:
+            bucket = "ATTIVO"; tipo = tipo or "SP"
+        elif "PASSIVO" in s or "DEBIT" in s:
+            bucket = "PASSIVO"; tipo = tipo or "SP"
+        elif "RICAV" in s or "PROVENT" in s:
+            bucket = "RICAVI"; tipo = tipo or "CE"
+        elif "COST" in s or "ONERI" in s:
+            bucket = "COSTI"; tipo = tipo or "CE"
+
+    if tipo not in ("SP", "CE"):
+        tipo = "SP"
+
+    return tipo, bucket
+
+@st.cache_data
+def inizializza_motori_ricerca(df_classificazione):
+    if df_classificazione is None or df_classificazione.empty:
+        return None
+
+    df_classificazione = df_classificazione.copy()
+    df_classificazione.columns = [c.strip() for c in df_classificazione.columns]
+
+    if "Classificabile" in df_classificazione.columns:
+        df_classificazione = df_classificazione[
+            df_classificazione["Classificabile"].astype(str).str.lower().str.strip() == "x"
+        ].copy()
+
+    col_cod = df_classificazione.columns[0]
+    col_desc = df_classificazione.columns[1]
+    col_natura = next((c for c in df_classificazione.columns if any(x in c.lower() for x in ["natura", "tipo"])), None)
+
+    codici, desc_sem, toks = [], [], []
+    map_desc, map_natura, map_tipo, map_bucket = {}, {}, {}, {}
+    combo = []
+    idx_dare, idx_avere = [], []
+
+    for idx, row in df_classificazione.iterrows():
+        code = str(row[col_cod]).strip()
+        desc = normalize_desc(str(row[col_desc]).strip())
+        nat = str(row[col_natura]).strip() if col_natura else ""
+
+        tipo, bucket = inferisci_tipo_bucket(nat)
+
+        codici.append(code)
+        desc_sem.append(desc)
+        toks.append(simple_tokenize(desc))
+
+        map_desc[code] = desc
+        map_natura[code] = nat
+        map_tipo[code] = tipo
+        map_bucket[code] = bucket
+
+        combo.append(f"{code} | {desc[:60]}")
+
+        nu = (nat or "").upper()
+        if any(x in nu for x in ['ATTIVO','SP-A','COST','ONERI','CE-C', 'A', 'C']):
+            idx_dare.append(idx)
+        elif any(x in nu for x in ['PASSIVO','SP-P','RICAV','PROVENT','CE-R', 'P', 'R']):
+            idx_avere.append(idx)
+        else:
+            idx_dare.append(idx); idx_avere.append(idx)
+
+    emb = semantic_model.encode(desc_sem, convert_to_tensor=True)
+    bm25 = BM25Okapi(toks)
+
+    return {
+        "codici": codici,
+        "desc_sem": desc_sem,
+        "emb": emb,
+        "bm25": bm25,
+        "map_desc": map_desc,
+        "map_natura": map_natura,
+        "map_tipo": map_tipo,
+        "map_bucket": map_bucket,
+        "combo": sorted(list(set(combo))),
+        "idx_d": idx_dare,
+        "idx_a": idx_avere
+    }
+
+# =========================================================
+# PDC HELPERS
+# =========================================================
+def estrai_pdc_da_pdf(file_obj):
+    map_pdc = {}
+    with pdfplumber.open(file_obj) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if not text:
+                continue
+            lines = text.split('\n')
+            for line in lines:
+                match = re.search(r"^(\d[\d\.]*)\s+(.+)", line.strip())
+                if match:
+                    code_raw = match.group(1)
+                    desc = match.group(2).strip()
+                    clean_code = normalizza_codice(code_raw)
+                    if len(clean_code) >= 2:
+                        map_pdc[clean_code] = desc
+    return map_pdc
+
+def analizza_pdc_universale(file_obj):
+    pdc_norm = {}
+    if file_obj.name.endswith('.pdf'):
+        pdc_norm = estrai_pdc_da_pdf(file_obj)
+    else:
+        df = leggi_csv_sicuro(file_obj)
+        if df is not None:
+            df = df.astype(str)
+            for _, r in df.iterrows():
+                clean_code = normalizza_codice(r.iloc[0])
+                desc = str(r.iloc[-1]).strip()
+                if clean_code:
+                    pdc_norm[clean_code] = desc
+    return pdc_norm
+
+def trova_padre_gerarchico(codice_raw, pdc_norm_map):
+    if not codice_raw or not pdc_norm_map:
+        return None, None
+    clean = normalizza_codice(codice_raw)
+    if clean in pdc_norm_map:
+        return clean, pdc_norm_map[clean]
+    while len(clean) > 1:
+        clean = clean[:-1]
+        if clean in pdc_norm_map:
+            return clean, f"(Gruppo Padre) {pdc_norm_map[clean]}"
+    return None, None
+
+# =========================================================
+# SIGN CORRECTION (soft)
+# =========================================================
+def correggi_segno_atteso(sf, natura_code, tipo, bucket):
+    nu = (natura_code or "").upper()
+    b = bucket
+    if b is None:
+        _, b2 = inferisci_tipo_bucket(nu)
+        b = b2
+
+    if tipo == "SP":
+        if b == "ATTIVO":
+            return abs(sf)
+        if b == "PASSIVO":
+            return -abs(sf)
+    if tipo == "CE":
+        if b == "RICAVI":
+            return abs(sf)
+        if b == "COSTI":
+            return -abs(sf)
+    return sf
+
+# =========================================================
+# Vision: utilities
+# =========================================================
+def crop_to_base64_jpeg(page, rect):
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=rect)
+    return base64.b64encode(pix.tobytes("jpg", jpg_quality=80)).decode('utf-8')
+
+def pagina_contiene_dati_utili(page_obj):
+    text = page_obj.get_text("text") or ""
+    if not text.strip():
+        return True
+    numeri = re.findall(r'\d+[\.,]\d+', text)
+    codici = re.findall(r'\d+(?:\.\d+)+', text)
+    return (len(numeri) + len(codici)) >= 4
+
+async def retry_async(fn, attempts=4, base=0.7):
+    last = None
+    for i in range(attempts):
+        try:
+            return await fn()
+        except Exception as e:
+            last = e
+            sleep = base * (2 ** i) + random.uniform(0, 0.25)
+            await asyncio.sleep(sleep)
+    raise last
+
+async def processa_chunk_async(client_async, img_base64, software_hint, sem):
+    prompt = f"""
+Analizza un bilancio ({software_hint}).
+
+OBIETTIVO:
+- Estrarre righe contabili con importo e natura (DARE/AVERE) in modo coerente.
+
+REGOLE PER NATURA:
+A) Se vedi colonne separate DARE/AVERE:
+   - Importo in colonna DARE -> natura=DARE
+   - Importo in colonna AVERE -> natura=AVERE
+B) Se NON vedi colonne DARE/AVERE (solo SALDO/IMPORTO unico):
+   - PASSIVO o RICAVI -> natura=AVERE
+   - ATTIVO o COSTI -> natura=DARE
+   - Se incerto, usa DARE ma NON inventare.
+
+IMPORTANTE:
+- Se l’importo è negativo (preceduto da - oppure tra parentesi), restituisci importo NEGATIVO.
+- Mantieni anche righe totali (servono per il risultato d’esercizio).
+
+ESTRAI:
+- codice (se presente, altrimenti "")
+- descrizione
+- natura: DARE o AVERE
+- importo: numero
+- is_raggruppamento: True se totale/raggruppamento
+""".strip()
+
+    async with sem:
+        async def call():
+            return await client_async.chat.completions.create(
+                model="gpt-4o",
+                response_model=BilancioEstratto,
+                max_tokens=2200,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}}
+                        ]
+                    }
+                ]
+            )
+
+        try:
+            resp = await retry_async(call)
+            # ✅ NON filtro i raggruppamenti: servono anche per trovare Risultato d’esercizio
+            righe = [r.model_dump() for r in resp.righe]
+            return righe
+        except:
+            return []
+
+async def estrai_pagina_adattivo(aclient, page, software_hint, sem):
+    h, w = page.rect.height, page.rect.width
+
+    full = await processa_chunk_async(aclient, crop_to_base64_jpeg(page, fitz.Rect(0, 0, w, h)), software_hint, sem)
+    if len(full) >= 8:
+        return full
+
+    top = await processa_chunk_async(aclient, crop_to_base64_jpeg(page, fitz.Rect(0, 0, w, h * 0.6)), software_hint, sem)
+    bot = await processa_chunk_async(aclient, crop_to_base64_jpeg(page, fitz.Rect(0, h * 0.4, w, h)), software_hint, sem)
+    return full + top + bot
+
+async def estrai_tutto_smart(pdf_bytes, software_hint, max_pagine_vision=20):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    sem = asyncio.Semaphore(5)
+    aclient = instructor.from_openai(AsyncOpenAI(api_key=api_key))
+
+    tasks = []
+    pagine_utili = 0
+    pagine_scartate = 0
+    vision_count = 0
+
+    prog_bar = st.progress(0)
+    status_text = st.empty()
+
+    for i, p in enumerate(doc):
+        if not pagina_contiene_dati_utili(p):
+            pagine_scartate += 1
+            status_text.text(f"Pag {i+1}/{len(doc)}: scartata (bassa densità)")
+            prog_bar.progress((i + 1) / len(doc))
+            continue
+
+        vision_count += 1
+        if vision_count > max_pagine_vision:
+            pagine_scartate += 1
+            status_text.text(f"Pag {i+1}/{len(doc)}: scartata (limite vision)")
+            prog_bar.progress((i + 1) / len(doc))
+            continue
+
+        pagine_utili += 1
+        status_text.text(f"Pag {i+1}/{len(doc)}: Vision in corso...")
+        tasks.append(estrai_pagina_adattivo(aclient, p, software_hint, sem))
+        prog_bar.progress((i + 1) / len(doc))
+
+    if pagine_utili == 0:
+        return [], 0, pagine_scartate
+
+    results = await asyncio.gather(*tasks)
+    flat = [item for sublist in results for item in sublist]
+    return flat, pagine_utili, pagine_scartate
+
+# =========================================================
+# NORMALIZZAZIONE RIGHE ESTRATTE (NON PERDERE SEGNO!)
+# =========================================================
+def normalizza_righe_estratte(rows):
+    out = []
+    for r in rows:
+        desc = normalize_desc(str(r.get("descrizione", "")))
+        if not desc:
+            continue
+
+        imp = parse_importo(r.get("importo", 0))  # mantengo segno
+        natura = (r.get("natura") or "DARE").upper().strip()
+        cod = str(r.get("codice", "")).strip()
+
+        # pulizia min
+        if natura not in ("DARE", "AVERE"):
+            natura = "DARE"
+
+        out.append({
+            "codice": cod,
+            "descrizione": desc,
+            "importo": imp,  # può essere negativo
+            "natura": natura,
+            "is_raggruppamento": bool(r.get("is_raggruppamento", False))
+        })
+    return out
+
+# =========================================================
+# NATURA IBRIDA (MISTO: DARE/AVERE o SALDO UNICO)
+# =========================================================
+PASSIVO_KW = [
+    "debiti", "debito", "fornitori", "mutuo", "finanziamento", "erario",
+    "tfr", "fondo", "inps", "inail", "iva debito", "ratei passivi",
+    "banche passive", "scoperto", "fidi"
+]
+RICAVI_KW = [
+    "ricavi", "vendite", "proventi", "interessi attivi", "plusval",
+    "contributi", "fatturato"
+]
+ATTIVO_KW = [
+    "crediti", "cassa", "banca", "immobilizzazioni", "rimanenze",
+    "iva credito", "ratei attivi", "depositi", "anticipi"
+]
+COSTI_KW = [
+    "acquisti", "servizi", "personale", "ammort", "oneri", "svalut",
+    "spese", "canoni", "consulenze", "utenze"
+]
+
+def decide_natura_ibrida(riga: dict, vision_affidabile: bool):
+    desc = (riga.get("descrizione") or "").lower()
+    natura = (riga.get("natura") or "").upper()
+    imp = float(riga.get("importo") or 0.0)
+
+    # 1) Se Vision è affidabile, tengo natura Vision e normalizzo importo a valore assoluto
+    if vision_affidabile and natura in ("DARE", "AVERE"):
+        riga["importo"] = abs(imp)
+        return natura
+
+    # 2) Se segno presente (tipico colonna unica)
+    if imp < 0:
+        riga["importo"] = abs(imp)
+        return "AVERE"
+    if imp > 0:
+        riga["importo"] = abs(imp)
+
+    # 3) Keyword contabili (passivo/ricavi -> AVERE, attivo/costi -> DARE)
+    if any(k in desc for k in PASSIVO_KW) or any(k in desc for k in RICAVI_KW):
+        return "AVERE"
+    if any(k in desc for k in ATTIVO_KW) or any(k in desc for k in COSTI_KW):
+        return "DARE"
+
+    # 4) fallback
+    return "DARE"
+
+# =========================================================
+# DEDUP ROBUSTO
+# =========================================================
+def deduplica_e_pulisci(lista):
+    PATTERN_SCARTO = r"^([A-E]\)|[IVX]+\s-|Totale|Somma|Risultato)"
+    cleaned = []
+    for r in lista:
+        desc = normalize_desc(str(r.get("descrizione", "")))
+        if not desc:
+            continue
+        if re.match(PATTERN_SCARTO, desc, re.IGNORECASE):
+            continue
+        if len(desc) < 3:
+            continue
+
+        rr = dict(r)
+        rr["codice"] = str(rr.get("codice", "")).strip()
+        rr["descrizione"] = desc
+        rr["importo"] = float(rr.get("importo", 0) or 0)
+        rr["natura"] = (rr.get("natura") or "DARE").upper()
+        cleaned.append(rr)
+
+    out = []
+    for r in cleaned:
+        is_dup = False
+        for o in out[-250:]:
+            same_code = (normalizza_codice(r["codice"]) == normalizza_codice(o["codice"])) and r["codice"] != ""
+            close_amt = abs(r["importo"] - o["importo"]) < 0.5
+            sim_desc = fuzz.token_sort_ratio(r["descrizione"].lower(), o["descrizione"].lower()) >= 93
+            if (same_code and close_amt) or (sim_desc and close_amt):
+                is_dup = True
+                break
+        if not is_dup:
+            out.append(r)
+    return out
+
+# =========================================================
+# RETRIEVAL IBRIDO
+# =========================================================
+def ricerca_ibrida(query, db, indices):
+    cands = []
+    toks = simple_tokenize(query)
+
+    bm_sc = db['bm25'].get_scores(toks)
+    bm_pairs = [(s, i) for i, s in enumerate(bm_sc) if i in indices]
+    bm_pairs.sort(key=lambda x: x[0], reverse=True)
+
+    for s, i in bm_pairs[:10]:
+        if s > 0:
+            cands.append({"codice": db['codici'][i], "descrizione": db['desc_sem'][i], "score": float(s), "src": "bm25"})
+
+    q_emb = semantic_model.encode(query, convert_to_tensor=True)
+    sem_sc = util.cos_sim(q_emb, db['emb'])[0]
+    mask = torch.zeros_like(sem_sc)
+    mask[indices] = 1.0
+    sem_sc = sem_sc * mask
+
+    top = torch.topk(sem_sc, k=10)
+    for s, i in zip(top[0], top[1]):
+        code = db['codici'][i]
+        if code not in [c['codice'] for c in cands]:
+            cands.append({"codice": code, "descrizione": db['desc_sem'][i], "score": float(s), "src": "sem"})
+
+    cands.sort(key=lambda x: (x["score"], 1 if x["src"] == "sem" else 0), reverse=True)
+    return cands[:10]
+
+def decisione_senza_llm(cands):
+    if not cands:
+        return False
+    if cands[0]["score"] > 0.82:
+        if len(cands) == 1:
+            return True
+        if (cands[0]["score"] - cands[1]["score"]) > 0.15:
+            return True
+    return False
+
+def scegli_fallback(cands, db):
+    if cands:
+        return cands[0]["codice"], "Fallback: scelto top candidato retrieval"
+    first = next(iter(db["map_desc"].keys()), "")
+    return first, "Fallback: nessun candidato, scelto primo codice disponibile"
+
+def compute_confidence(code, cands, info_padre, used_llm: bool):
+    rank = next((i + 1 for i, c in enumerate(cands) if c["codice"] == code), None)
+    top = cands[0]["score"] if cands else 0.0
+    in_top5 = rank is not None and rank <= 5
+    has_pdc = bool(info_padre and info_padre[0])
+    score = 0.0
+    score += 0.45 * (1.0 if in_top5 else 0.35)
+    score += 0.30 * min(1.0, max(0.0, float(top)))
+    score += 0.15 * (1.0 if has_pdc else 0.65)
+    score += 0.10 * (0.95 if not used_llm else 0.85)
+    return round(min(1.0, score), 3)
+
+def ragionatore_gerarchico(client, r, info_padre, cands, db):
+    desc = r.get('descrizione')
+    cod = r.get('codice')
+    contest_pdc = "NESSUN MATCH NEL PDC."
+    if info_padre:
+        cod_padre, desc_padre = info_padre
+        contest_pdc = f"MATCH GERARCHICO: Codice {cod} -> Gruppo '{cod_padre} {desc_padre}'."
+
+    safe = []
+    for c in cands[:5]:
+        code = c["codice"]
+        safe.append({
+            "codice": code,
+            "score": round(float(c["score"]), 4),
+            "tipo": db["map_tipo"].get(code, "SP"),
+            "bucket": db["map_bucket"].get(code, None),
+            "descrizione": (db["map_desc"].get(code, "") or "")[:80],
+        })
+
+    cand_only = [x["codice"] for x in safe]
+
+    prompt = f"""
+Sei un Revisore Contabile.
+Devi selezionare il codice CORRETTO esclusivamente tra i candidati forniti.
+Non inventare codici.
+
+INPUT: "{desc}" (Cod: {cod})
+IMPORTO: {r.get('importo')} NATURA: {r.get('natura')}
+PDC (vincolo): {contest_pdc}
+
+CANDIDATI (scegli uno di questi): {json.dumps(cand_only)}
+DETTAGLI CANDIDATI: {json.dumps(safe)}
+
+REGOLE:
+1) Se PDC indica debito/passivo, NON selezionare conti costo.
+2) Se incerto, scegli il candidato con score maggiore.
+
+JSON OUTPUT:
+{{"codice_scelto":"<uno dei candidati>", "ragionamento":"max 2 frasi"}}
+""".strip()
+
+    try:
+        res = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            response_format={"type": "json_object"}
+        )
+        d = json.loads(res.choices[0].message.content)
+        code = (d.get("codice_scelto") or "").strip()
+        reason = (d.get("ragionamento") or "").strip()
+        if code not in cand_only:
+            return "", "LLM ha restituito codice non in lista (fallback)"
+        return code, reason
+    except:
+        return "", ""
+
+# =========================================================
+# ANOMALIE
+# =========================================================
+def analizza_anomalie(df):
+    anomalie = []
+    for _, r in df.iterrows():
+        desc = str(r['Descrizione']).lower()
+        saldo = float(r['Saldo finale'])
+        tipo = r['Tipo']
+
+        if "cassa" in desc and saldo < 0:
+            anomalie.append(f"⚠️ **Cassa negativa:** {r['Descrizione']} ({saldo:,.2f}€)")
+        if "iva" in desc and "credito" in desc and saldo < 0:
+            anomalie.append(f"⚠️ **IVA credito con segno anomalo:** {r['Descrizione']} ({saldo:,.2f}€)")
+        if "iva" in desc and "debito" in desc and saldo > 0:
+            anomalie.append(f"⚠️ **IVA debito con segno anomalo:** {r['Descrizione']} ({saldo:,.2f}€)")
+        if "fornitor" in desc and saldo > 0:
+            anomalie.append(f"❓ **Fornitori con saldo positivo:** {r['Descrizione']} ({saldo:,.2f}€)")
+        if "client" in desc and saldo < 0:
+            anomalie.append(f"❓ **Clienti con saldo negativo:** {r['Descrizione']} ({saldo:,.2f}€)")
+        if tipo == "CE" and saldo > 0 and all(x not in desc for x in ["ricav", "provent", "plusval", "rimbor", "contribut"]):
+            anomalie.append(f"❓ **CE positivo anomalo:** {r['Descrizione']} ({saldo:,.2f}€)")
+    return anomalie
+
+# =========================================================
+# UI
+# =========================================================
+banner_img = "Revilaw S.p.A..jpg"
+if os.path.exists(banner_img):
+    st.image(banner_img, use_container_width=True)
+else:
+    st.markdown("## 🧬 Revilaw AuditEv Hierarchy (Quality)")
+
+with st.sidebar:
+    st.markdown("### 🎛️ Pannello Controllo")
+    f_pdf = st.file_uploader("1. Bilancio (PDF)", type="pdf")
+    f_cls = st.file_uploader("2. Classificazione (XLSX/CSV)", type=["xlsx", "csv"])
+    f_pdc = st.file_uploader("3. Piano Conti (PDF/XLSX/CSV)", type=["xlsx", "csv", "pdf"])
+
+    st.markdown("---")
+    sw = st.selectbox("Software Origine", list(SOFTWARE_PROMPTS.keys()))
+    max_pagine_vision = st.slider("Max pagine Vision (costi)", min_value=5, max_value=120, value=25, step=5)
+    st.markdown("---")
+
+    ready = f_pdf is not None and f_cls is not None and api_key and len(api_key) > 10
+    start_analysis = st.button("🚀 AVVIA ELABORAZIONE", disabled=not ready, type="primary")
+
+    if not api_key:
+        st.caption("🔴 Configura OPENAI_API_KEY (st.secrets o env).")
+    elif not ready:
+        st.caption("🔴 Carica i file richiesti.")
+
+# =========================================================
+# PIPELINE
+# =========================================================
+if start_analysis:
+    main_placeholder = st.empty()
+    main_placeholder.info("⚙️ Inizializzazione...")
+
+    try:
+        raw_client = OpenAI(api_key=api_key)
+        st.session_state['data_processed'] = None
+        st.session_state['logs'] = []
+        st.session_state['raw_pdf_rows'] = []
+
+        # 1) Indicizzazione classificazione
+        df_c = leggi_csv_sicuro(f_cls)
+        if df_c is None:
+            st.error("Errore file classificazione.")
+            st.stop()
+
+        db = inizializza_motori_ricerca(df_c)
+        st.session_state['combo_options'] = db['combo']
+        st.session_state['map_code_desc'] = db['map_desc']
+        st.session_state['map_code_natura'] = db['map_natura']
+        st.session_state['map_code_tipo'] = db['map_tipo']
+        st.session_state['map_code_bucket'] = db['map_bucket']
+
+        log("CLASSIFICAZIONE", f"Indicizzata: {len(db['codici'])} righe.")
+
+        # 2) PDC
+        pdc_norm_map = {}
+        if f_pdc:
+            main_placeholder.info("🧬 Indicizzazione PDC...")
+            pdc_norm_map = analizza_pdc_universale(f_pdc)
+            st.success(f"PDC indicizzato: {len(pdc_norm_map)} voci.")
+            log("PDC", f"Indicizzato: {len(pdc_norm_map)} voci.")
+        else:
+            log("PDC", "Non caricato.", level="WARN")
+
+        # 3) Vision
+        f_pdf.seek(0)
+        pdf_bytes = f_pdf.read()
+        main_placeholder.info("🚀 Estrazione bilancio (Vision adattivo + filtro)...")
+        raw, p_utili, p_scartate = run_async(
+            estrai_tutto_smart(pdf_bytes, SOFTWARE_PROMPTS[sw], max_pagine_vision=max_pagine_vision)
+        )
+
+        log("VISION", f"Finita: pagine utili={p_utili}, scartate={p_scartate}, righe raw={len(raw)}")
+        main_placeholder.success(f"✅ Vision: analizzate {p_utili} pagine. Scartate {p_scartate}.")
+
+        # 4) Normalizza (mantengo segno) + natura ibrida
+        raw_norm = normalizza_righe_estratte(raw)
+
+        vc = pd.Series([r.get("natura","") for r in raw_norm]).value_counts()
+        ratio_avere = vc.get("AVERE", 0) / max(1, len(raw_norm))
+        vision_affidabile = ratio_avere >= 0.12
+        log("VISION", f"Natura estratta: {dict(vc)} | ratio_avere={ratio_avere:.2f}")
+
+        for r in raw_norm:
+            r["natura"] = decide_natura_ibrida(r, vision_affidabile)
+            # in decide_natura_ibrida imposto importo sempre positivo per pipeline
+
+        # ✅ Salvo raw normalizzato per ris_pdf
+        st.session_state["raw_pdf_rows"] = raw_norm.copy()
+
+        # 5) Dedup + pulizia
+        unique = deduplica_e_pulisci(raw_norm)
+        log("PULIZIA", f"Righe dopo normalizzazione+dedup: {len(unique)}")
+
+        if not unique:
+            st.error("❌ Nessun dato estratto.")
+            st.stop()
+
+        # 6) Classificazione
+        main_placeholder.info(f"🧠 Classificazione (quality mode) su {len(unique)} righe...")
+        final = []
+        progress_bar = st.progress(0)
+        tot_rows = len(unique)
+
+        for i, r in enumerate(unique):
+            progress_bar.progress((i + 1) / tot_rows)
+
+            desc = r.get('descrizione', '').strip()
+            cod_raw = r.get('codice', '').strip()
+
+            info_padre = None
+            if pdc_norm_map and cod_raw:
+                info_padre = trova_padre_gerarchico(cod_raw, pdc_norm_map)
+
+            # Se Vision non affidabile, non filtro idx_d/idx_a
+            if vision_affidabile:
+                idxs = db['idx_d'] if r.get('natura') == 'DARE' else db['idx_a']
+            else:
+                idxs = list(range(len(db["codici"])))
+
+            query = desc
+            if info_padre and info_padre[1]:
+                query += f" | PDC:{info_padre[1]}"
+
+            cands = ricerca_ibrida(query, db, idxs)
+
+            used_llm = False
+            if decisione_senza_llm(cands):
+                code = cands[0]["codice"]
+                reason = "Scelta deterministica: retrieval molto alto"
+            else:
+                used_llm = True
+                code, reason = ragionatore_gerarchico(raw_client, r, info_padre, cands, db)
+
+            if not code:
+                code, fb_reason = scegli_fallback(cands, db)
+                reason = (reason + " | " if reason else "") + fb_reason
+                used_llm = False
+
+            desc_audit = db['map_desc'].get(code, "???")
+            combo = f"{code} | {desc_audit}"
+            if combo not in db['combo']:
+                combo = next((x for x in db['combo'] if x.startswith(f"{code} |")), combo)
+
+            imp = abs(parse_importo(r.get('importo', 0)))
+            sd = abs(imp) if r.get('natura') == 'DARE' else 0.0
+            sa = abs(imp) if r.get('natura') == 'AVERE' else 0.0
+
+            tipo = db['map_tipo'].get(code, "SP")
+            bucket = db['map_bucket'].get(code, None)
+            natura_code = db['map_natura'].get(code, "")
+
+            sf = (sa - sd) if tipo == "CE" else (sd - sa)
+
+            # correzione segno solo se bucket certo
+            if bucket in ("ATTIVO", "PASSIVO", "COSTI", "RICAVI"):
+                sf = correggi_segno_atteso(sf, natura_code, tipo, bucket)
+
+            debug_gerarchia = info_padre[1] if info_padre else "N/A"
+            conf = compute_confidence(code, cands, info_padre, used_llm)
+            top3 = [{"codice": c["codice"], "score": round(float(c["score"]), 4)} for c in cands[:3]]
+
+            final.append({
+                "__id": i,
+                "Codice": cod_raw,
+                "Descrizione": desc,
+                "Gerarchia PDC": debug_gerarchia,
+                "Confidence_finale": conf,
+                "Top3": json.dumps(top3, ensure_ascii=False),
+                "Ragionamento AI": reason,
+                "Saldo dare": sd,
+                "Saldo avere": sa,
+                "Saldo finale": sf,
+                "Classificazione_Combo": combo,
+                "Tipo": tipo,
+                "Inverti Segno": False,
+            })
+
+        final_df = pd.DataFrame(final)
+        final_df.sort_values(by="Codice", inplace=True)
+        st.session_state['data_processed'] = final_df
+        main_placeholder.empty()
+        st.rerun()
+
+    except Exception as e:
+        st.error(f"Errore Critico: {str(e)}")
+        log("ERRORE", str(e), level="ERROR")
+
+# =========================================================
+# VISUALIZZAZIONE
+# =========================================================
+if st.session_state['data_processed'] is not None:
+    df = st.session_state['data_processed']
+    map_tipo = st.session_state.get('map_code_tipo', {})
+
+    st.markdown("### 📊 Dashboard")
+
+    with st.container():
+        df_sp = df[df['Tipo'] == 'SP']
+        df_ce = df[df['Tipo'] == 'CE']
+
+        tot_attivo = df_sp[df_sp['Saldo finale'] > 0]['Saldo finale'].sum()
+        tot_passivo = df_sp[df_sp['Saldo finale'] < 0]['Saldo finale'].sum()
+        tot_risultato = df_ce['Saldo finale'].sum()
+        tot_sp_netto = df_sp['Saldo finale'].sum()
+        diff = tot_sp_netto - tot_risultato
+
+        # Risultato come da PDF (metodo 1: rows)
+        ris_pdf, ris_pdf_desc = estrai_risultato_da_rows(st.session_state.get("raw_pdf_rows", []))
+
+        # fallback: testo PDF (se testuale)
+        if ris_pdf is None and f_pdf is not None:
+            ris_pdf, ris_pdf_desc = estrai_risultato_da_testo_pdf(f_pdf)
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("ATTIVO", f"€ {tot_attivo:,.2f}", delta="Patrimoniale")
+        c2.metric("PASSIVO", f"€ {tot_passivo:,.2f}", delta="Patrimoniale", delta_color="inverse")
+        c3.metric("RISULTATO (RICL.)", f"€ {tot_risultato:,.2f}", delta="Economico")
+
+        if abs(diff) < 1.0:
+            c4.success("✅ QUADRATO")
+        else:
+            c4.error(f"⚠️ SBILANCIO: € {diff:,.2f}")
+
+        if ris_pdf is not None:
+            c5.metric("RISULTATO (PDF)", f"€ {ris_pdf:,.2f}", delta=(ris_pdf_desc or "")[:35])
+        else:
+            c5.metric("RISULTATO (PDF)", "N/D", delta="Non trovato")
+
+        if ris_pdf is not None and abs(ris_pdf - tot_risultato) > 1:
+            st.warning(f"⚠️ Differenza Risultato PDF vs Riclassificato: € {(ris_pdf - tot_risultato):,.2f}")
+
+    anomalie = analizza_anomalie(df)
+    if anomalie:
+        with st.expander(f"🚨 {len(anomalie)} Anomalie", expanded=True):
+            for a in anomalie:
+                st.markdown(a)
+
+    with st.expander("🪵 Debug log (chiaro)", expanded=False):
+        logs = st.session_state.get("logs", [])
+        if not logs:
+            st.info("Nessun log disponibile.")
+        else:
+            df_log = pd.DataFrame(logs)
+            st.dataframe(df_log, use_container_width=True, hide_index=True)
+
+    tab_edit, tab_exp = st.tabs(["📝 Revisione", "💾 Export"])
+
+    # ----------------------------
+    # TAB EDIT (solo 5 colonne)
+    # ----------------------------
+    with tab_edit:
+        df_v = df.copy()
+
+        edited = st.data_editor(
+            df_v,
+            column_order=[
+                "Codice",
+                "Descrizione",
+                "Saldo finale",
+                "Inverti Segno",
+                "Classificazione_Combo"
+            ],
+            column_config={
+                "Classificazione_Combo": st.column_config.SelectboxColumn(
+                    "Classificazione",
+                    options=st.session_state['combo_options'],
+                    width="medium"
+                ),
+                "Saldo finale": st.column_config.NumberColumn(
+                    "Saldo finale",
+                    format="%.2f €",
+                    disabled=True
+                ),
+                "Inverti Segno": st.column_config.CheckboxColumn(
+                    "Inverti Segno"
+                ),
+                "Codice": st.column_config.TextColumn(
+                    "Codice conto",
+                    disabled=True
+                ),
+                "Descrizione": st.column_config.TextColumn(
+                    "Descrizione",
+                    disabled=True
+                ),
+                "__id": None
+            },
+            height=600,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        upd = False
+        for _, row in edited.iterrows():
+            rid = int(row["__id"])
+            mask = df["__id"] == rid
+            orig = df[mask].iloc[0]
+
+            if (row["Classificazione_Combo"] != orig["Classificazione_Combo"]) or (row["Inverti Segno"] != orig["Inverti Segno"]):
+                upd = True
+                c = str(row["Classificazione_Combo"])
+                code = c.split("|")[0].strip() if "|" in c else c.strip()
+
+                tipo = map_tipo.get(code, "SP")
+                d = float(orig['Saldo dare'])
+                a = float(orig['Saldo avere'])
+
+                sf = (a - d) if tipo == "CE" else (d - a)
+                if bool(row["Inverti Segno"]):
+                    sf = -sf
+
+                df.loc[mask, "Classificazione_Combo"] = c
+                df.loc[mask, "Saldo finale"] = sf
+                df.loc[mask, "Tipo"] = tipo
+                df.loc[mask, "Inverti Segno"] = bool(row["Inverti Segno"])
+
+        if upd:
+            st.session_state['data_processed'] = df
+            st.rerun()
+
+    # ----------------------------
+    # TAB EXPORT
+    # ----------------------------
+    with tab_exp:
+        out = BytesIO()
+        with pd.ExcelWriter(out, engine='xlsxwriter') as w:
+            dx = df.copy()
+            dx["Classificazione"] = dx["Classificazione_Combo"].apply(lambda x: x.split("|")[0].strip() if "|" in str(x) else str(x))
+
+            cols = [
+                "Codice", "Descrizione", "Saldo dare", "Saldo avere", "Saldo finale",
+                "Classificazione", "Tipo", "Confidence_finale", "Gerarchia PDC", "Ragionamento AI", "Top3"
+            ]
+            dx2 = dx[cols]
+            dx2.to_excel(w, index=False, sheet_name="Bilancio")
+
+            wb = w.book
+            ws = w.sheets["Bilancio"]
+
+            fmt_head = wb.add_format({'bold': True, 'bg_color': '#003366', 'font_color': 'white', 'border': 1})
+            fmt_curr = wb.add_format({'num_format': '#,##0.00 €'})
+            fmt_neg = wb.add_format({'num_format': '#,##0.00 €', 'font_color': 'red'})
+            fmt_conf = wb.add_format({'num_format': '0.000'})
+
+            ws.freeze_panes(1, 0)
+            ws.autofilter(0, 0, len(dx2), len(cols) - 1)
+
+            for c, v in enumerate(cols):
+                ws.write(0, c, v, fmt_head)
+
+            for r in range(1, len(dx2) + 1):
+                for c in [2, 3, 4]:
+                    val = dx2.iloc[r-1, c]
+                    try:
+                        fval = float(val)
+                    except:
+                        fval = 0.0
+                    fmt = fmt_neg if fval < 0 else fmt_curr
+                    ws.write_number(r, c, fval, fmt)
+
+                try:
+                    ws.write_number(r, 7, float(dx2.iloc[r-1, 7]), fmt_conf)
+                except:
+                    ws.write_number(r, 7, 0.0, fmt_conf)
+
+            ws.set_column('A:A', 14)
+            ws.set_column('B:B', 55)
+            ws.set_column('C:E', 18)
+            ws.set_column('F:F', 16)
+            ws.set_column('G:H', 10)
+            ws.set_column('I:I', 28)
+            ws.set_column('J:J', 50)
+            ws.set_column('K:K', 40)
+
+        out.seek(0)
+        st.download_button("💾 SCARICA EXCEL", data=out, file_name="Revilaw_Bilancio_QUALITY.xlsx", type="primary")
+
+else:
+    st.markdown(
+        "<div style='text-align: center; color: gray; margin-top: 50px;'><h3>👋 Carica i file per iniziare</h3></div>",
+        unsafe_allow_html=True
+    )
